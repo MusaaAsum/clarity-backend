@@ -1,4 +1,4 @@
-# main.py - Backend FastAPI complet pour Clarity
+# main.py - Backend FastAPI avec CORS corrigé
 import os
 import jwt
 import bcrypt
@@ -9,64 +9,56 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
-import uvicorn
+from sqlalchemy.orm import sessionmaker, Session
+import uuid
 import re
 
 # Configuration
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./clarity.db")
+SECRET_KEY = "your-secret-key-change-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # Base de données
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+SQLALCHEMY_DATABASE_URL = "sqlite:///./clarity.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Modèles de données
+# Modèles de base de données
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
-    sessions = relationship("CoachingSession", back_populates="user")
 
 class CoachingSession(Base):
-    __tablename__ = "coaching_sessions"
+    __tablename__ = "sessions"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    title = Column(String)
+    uuid = Column(String, unique=True, index=True)
+    user_id = Column(Integer)
     problem_description = Column(Text)
-    status = Column(String, default="in_progress")  # in_progress, completed
+    status = Column(String, default="in_progress")
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
-    user = relationship("User", back_populates="sessions")
-    responses = relationship("QuestionResponse", back_populates="session")
-    action_plan = relationship("ActionPlan", back_populates="session", uselist=False)
 
 class QuestionResponse(Base):
     __tablename__ = "question_responses"
     id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(Integer, ForeignKey("coaching_sessions.id"))
+    session_uuid = Column(String)
     question_key = Column(String)
-    question_text = Column(Text)
-    response = Column(Text)
+    answer = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-    session = relationship("CoachingSession", back_populates="responses")
 
 class ActionPlan(Base):
     __tablename__ = "action_plans"
     id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(Integer, ForeignKey("coaching_sessions.id"))
-    inherited_fixed = Column(Text)  # JSON des éléments hérités non changeables
-    inherited_changeable = Column(Text)  # JSON des éléments hérités changeables
-    created_fixed = Column(Text)  # JSON des éléments créés non changeables
-    created_actionable = Column(Text)  # JSON des éléments créés actionnables
-    actions = Column(Text)  # JSON des 3 actions concrètes
+    session_uuid = Column(String)
+    analysis = Column(Text)
+    actions = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-    session = relationship("CoachingSession", back_populates="action_plan")
 
 # Créer les tables
 Base.metadata.create_all(bind=engine)
@@ -84,28 +76,25 @@ class SessionStart(BaseModel):
     problem_description: str
 
 class QuestionAnswer(BaseModel):
+    session_id: str
     question_key: str
-    response: str
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
+    answer: str
 
 # FastAPI app
 app = FastAPI(title="Clarity API", version="1.0.0")
 
-# CORS
+# CORS Configuration - CORRECTION CRITIQUE
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En production: spécifier les domaines autorisés
+    allow_origins=["*"],  # En production, remplacez par votre domaine Vercel
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Security
 security = HTTPBearer()
 
+# Dépendances
 def get_db():
     db = SessionLocal()
     try:
@@ -113,323 +102,271 @@ def get_db():
     finally:
         db.close()
 
-def create_access_token(data: dict):
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=7)
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
         if email is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Token invalide")
     except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Token invalide")
     
     user = db.query(User).filter(User.email == email).first()
     if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="Utilisateur non trouvé")
     return user
 
-# Moteur de questions intelligentes
-class QuestionsEngine:
-    @staticmethod
-    def generate_questions(problem_description: str) -> List[Dict[str, Any]]:
-        """Génère des questions adaptées selon le problème décrit"""
-        questions = [
-            {
-                "key": "duration",
-                "text": "Depuis combien de temps cette situation dure-t-elle ?",
-                "type": "text"
-            },
-            {
-                "key": "context",
-                "text": "Dans quel contexte cela se produit-il le plus souvent ?",
-                "type": "text"
-            },
-            {
-                "key": "feelings",
-                "text": "Quelles émotions ressentez-vous face à cette situation ?",
-                "type": "text"
-            },
-            {
-                "key": "attempts",
-                "text": "Qu'avez-vous déjà essayé pour résoudre cela ?",
-                "type": "text"
-            },
-            {
-                "key": "patterns",
-                "text": "Y a-t-il des éléments récurrents que vous remarquez ?",
-                "type": "text"
-            }
-        ]
-        
-        # Questions spécifiques selon les mots-clés
-        problem_lower = problem_description.lower()
-        
-        if any(word in problem_lower for word in ["relation", "copain", "copine", "ami", "couple"]):
-            questions.extend([
-                {
-                    "key": "relationship_pattern",
-                    "text": "Ce schéma se répète-t-il dans vos relations ?",
-                    "type": "text"
-                },
-                {
-                    "key": "communication_style",
-                    "text": "Comment communiquez-vous généralement lors de conflits ?",
-                    "type": "text"
-                }
-            ])
-        
-        if any(word in problem_lower for word in ["travail", "job", "carrière", "patron"]):
-            questions.extend([
-                {
-                    "key": "work_environment",
-                    "text": "L'environnement de travail influence-t-il cette situation ?",
-                    "type": "text"
-                },
-                {
-                    "key": "career_goals",
-                    "text": "Cela affecte-t-il vos objectifs professionnels ?",
-                    "type": "text"
-                }
-            ])
-        
-        return questions[:6]  # Maximum 6 questions
-    
-    @staticmethod
-    def analyze_responses(responses: List[Dict[str, str]], problem_description: str) -> Dict[str, Any]:
-        """Analyse les réponses et génère la matrice + plan d'action"""
-        
-        # Créer un texte complet pour l'analyse
-        full_text = problem_description + " " + " ".join([r["response"] for r in responses])
-        full_text_lower = full_text.lower()
-        
-        # Classification dans les 4 quadrants
-        inherited_fixed = []
-        inherited_changeable = []
-        created_fixed = []
-        created_actionable = []
-        
-        # Mots-clés pour détecter l'hérité vs créé
-        inherited_keywords = ["né", "naissance", "famille", "parents", "enfance", "physique", "taille", "couleur", "origine", "génétique"]
-        created_keywords = ["choix", "décision", "réaction", "comportement", "habitude", "communication", "attitude", "pensée"]
-        
-        # Mots-clés pour détecter le changeable vs fixe
-        changeable_keywords = ["apprendre", "améliorer", "changer", "développer", "travailler", "effort", "pratiquer", "modifier"]
-        fixed_keywords = ["passé", "déjà fait", "terminé", "impossible", "jamais", "toujours été"]
-        
-        # Analyse simple par mots-clés (version MVP)
-        if any(keyword in full_text_lower for keyword in inherited_keywords):
-            inherited_fixed.append("Caractéristiques personnelles héritées")
-            inherited_changeable.append("Façons de composer avec ces caractéristiques")
-        
-        if any(keyword in full_text_lower for keyword in created_keywords):
-            created_actionable.extend([
-                "Vos réactions face à la situation",
-                "Votre façon de communiquer",
-                "Vos habitudes dans ce contexte"
-            ])
-        
-        # Génération d'actions concrètes
-        actions = QuestionsEngine.generate_actions(full_text_lower, responses)
-        
-        return {
-            "inherited_fixed": inherited_fixed,
-            "inherited_changeable": inherited_changeable,
-            "created_fixed": created_fixed,
-            "created_actionable": created_actionable,
-            "actions": actions
-        }
-    
-    @staticmethod
-    def generate_actions(text: str, responses: List[Dict[str, str]]) -> List[str]:
-        """Génère 3 actions concrètes basées sur l'analyse"""
-        
-        actions = []
-        
-        # Actions selon le type de problème détecté
-        if any(word in text for word in ["relation", "communication", "conflit"]):
-            actions = [
-                "Cette semaine : Noter chaque fois que vous réagissez impulsivement dans une conversation",
-                "Avant vendredi : Avoir une conversation claire avec une personne concernée par la situation",
-                "Dans les 7 jours : Demander un retour honnête à un proche sur votre style de communication"
-            ]
-        elif any(word in text for word in ["travail", "carrière", "patron"]):
-            actions = [
-                "Aujourd'hui : Identifier une compétence concrète à développer pour cette situation",
-                "Cette semaine : Planifier 30 minutes quotidiennes pour travail sur cette compétence",
-                "Avant dimanche : Parler de votre situation à un mentor ou collègue de confiance"
-            ]
-        elif any(word in text for word in ["confiance", "estime", "soi"]):
-            actions = [
-                "Chaque jour : Noter 3 choses que vous avez bien gérées dans la journée",
-                "Cette semaine : Faire une activité où vous excellez naturellement",
-                "Dans 5 jours : Fixer une petite limite que vous n'aviez jamais osé poser"
-            ]
-        else:
-            # Actions génériques
-            actions = [
-                "Aujourd'hui : Identifier précisément un élément sur lequel vous avez du contrôle",
-                "Cette semaine : Passer à l'action sur cet élément pendant 15 minutes par jour",
-                "Dans les 7 jours : Parler de votre situation à quelqu'un de confiance"
-            ]
-        
-        return actions[:3]
+# Routes principales
+@app.get("/")
+async def root():
+    return {"message": "Clarity API", "status": "running"}
 
-# Routes d'authentification
-@app.post("/auth/register", response_model=Token)
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+# Authentification
+@app.post("/auth/register")
 async def register(user_data: UserCreate, db: Session = Depends(get_db)):
     # Vérifier si l'utilisateur existe
     existing_user = db.query(User).filter(User.email == user_data.email).first()
     if existing_user:
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=400, detail="Email déjà utilisé")
     
     # Hasher le mot de passe
-    hashed_password = bcrypt.hashpw(user_data.password.encode('utf-8'), bcrypt.gensalt())
+    hashed_password = bcrypt.hashpw(user_data.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     
     # Créer l'utilisateur
-    user = User(email=user_data.email, hashed_password=hashed_password.decode('utf-8'))
+    user = User(email=user_data.email, hashed_password=hashed_password)
     db.add(user)
     db.commit()
     db.refresh(user)
     
     # Créer le token
-    access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/auth/login", response_model=Token)
-async def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == user_data.email).first()
-    if not user or not bcrypt.checkpw(user_data.password.encode('utf-8'), user.hashed_password.encode('utf-8')):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-# Routes des sessions
-@app.post("/sessions/start")
-async def start_session(session_data: SessionStart, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Créer une nouvelle session
-    session = CoachingSession(
-        user_id=current_user.id,
-        title=session_data.problem_description[:50] + "...",
-        problem_description=session_data.problem_description
-    )
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    
-    # Générer les questions
-    questions = QuestionsEngine.generate_questions(session_data.problem_description)
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
     
     return {
-        "session_id": session.id,
-        "questions": questions
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {"id": user.id, "email": user.email}
     }
 
-@app.post("/sessions/{session_id}/respond")
-async def respond_to_question(
-    session_id: int, 
-    answer: QuestionAnswer, 
-    current_user: User = Depends(get_current_user), 
-    db: Session = Depends(get_db)
-):
-    # Vérifier que la session appartient à l'utilisateur
-    session = db.query(CoachingSession).filter(
-        CoachingSession.id == session_id,
-        CoachingSession.user_id == current_user.id
-    ).first()
+@app.post("/auth/login")
+async def login(form_data: UserLogin, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.email).first()
+    if not user or not bcrypt.checkpw(form_data.password.encode('utf-8'), user.hashed_password.encode('utf-8')):
+        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect")
     
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
     
-    # Enregistrer la réponse
-    response = QuestionResponse(
-        session_id=session_id,
-        question_key=answer.question_key,
-        question_text="",  # On pourrait stocker le texte de la question aussi
-        response=answer.response
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {"id": user.id, "email": user.email}
+    }
+
+@app.get("/auth/me")
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    return {"id": current_user.id, "email": current_user.email}
+
+# Moteur de questions
+@dataclass
+class Question:
+    key: str
+    text: str
+    type: str = "text"
+
+def generate_questions(problem_description: str) -> List[Question]:
+    questions = [
+        Question("duration", "Depuis combien de temps cette situation dure-t-elle ?"),
+        Question("triggers", "Qu'est-ce qui déclenche généralement ce problème ?"),
+        Question("attempts", "Qu'avez-vous déjà essayé pour résoudre cela ?"),
+        Question("context", "Dans quel contexte ce problème se manifeste-t-il le plus ?"),
+        Question("impact", "Comment cela affecte-t-il votre quotidien ?")
+    ]
+    
+    # Adaptation selon le contenu
+    if any(word in problem_description.lower() for word in ["travail", "job", "bureau", "collègue", "patron"]):
+        questions.append(Question("work_specific", "Comment vos collègues/supérieurs réagissent-ils à cette situation ?"))
+    
+    if any(word in problem_description.lower() for word in ["relation", "copain", "copine", "famille", "ami"]):
+        questions.append(Question("relationship_specific", "Comment cette situation affecte-t-elle vos relations proches ?"))
+    
+    return questions
+
+def analyze_responses(problem: str, responses: List[Dict]) -> Dict[str, List[str]]:
+    # Mots-clés pour la classification
+    inherited_keywords = ["né", "famille", "parents", "enfance", "naturellement", "toujours été", "depuis petit"]
+    changeable_keywords = ["réaction", "choix", "décision", "communication", "attitude", "comportement", "habitude"]
+    
+    analysis = {
+        "inherited_fixed": [],
+        "inherited_changeable": [],
+        "created_fixed": [],
+        "created_changeable": []
+    }
+    
+    # Analyser le problème principal
+    problem_lower = problem.lower()
+    if any(keyword in problem_lower for keyword in inherited_keywords):
+        if any(keyword in problem_lower for keyword in changeable_keywords):
+            analysis["inherited_changeable"].append("Trait de personnalité à développer")
+        else:
+            analysis["inherited_fixed"].append("Caractéristique héritée à accepter")
+    else:
+        if any(keyword in problem_lower for keyword in changeable_keywords):
+            analysis["created_changeable"].append("Comportement modifiable")
+        else:
+            analysis["created_fixed"].append("Situation passée à assumer")
+    
+    # Analyser les réponses
+    for response in responses:
+        answer_lower = response["answer"].lower()
+        
+        if "depuis toujours" in answer_lower or "enfance" in answer_lower:
+            analysis["inherited_fixed"].append(f"Aspect ancien: {response['answer'][:50]}...")
+        elif "communication" in answer_lower or "réaction" in answer_lower:
+            analysis["created_changeable"].append(f"Point d'action: {response['answer'][:50]}...")
+        elif "essayé" in answer_lower:
+            analysis["created_fixed"].append(f"Tentative passée: {response['answer'][:50]}...")
+    
+    # Ajouter des éléments par défaut si vide
+    if not analysis["created_changeable"]:
+        analysis["created_changeable"].append("Votre façon de réagir à cette situation")
+    
+    return analysis
+
+def generate_action_plan(analysis: Dict[str, List[str]]) -> List[str]:
+    actions = []
+    
+    # Focus sur la zone "created_changeable"
+    changeable_items = analysis.get("created_changeable", [])
+    
+    if changeable_items:
+        actions.append("Cette semaine : Observez vos réactions automatiques dans cette situation")
+        actions.append("Identifiez UN petit changement que vous pouvez faire dès aujourd'hui")
+        actions.append("Partagez votre réflexion avec une personne de confiance")
+    else:
+        actions.append("Concentrez-vous sur l'acceptation de ce qui ne dépend pas de vous")
+        actions.append("Identifiez vos forces pour mieux gérer cette situation")
+        actions.append("Cherchez du soutien auprès de vos proches")
+    
+    return actions
+
+# Routes de session
+@app.post("/sessions/start")
+async def start_session(session_data: SessionStart, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    session_uuid = str(uuid.uuid4())
+    
+    session = CoachingSession(
+        uuid=session_uuid,
+        user_id=current_user.id,
+        problem_description=session_data.problem_description,
+        status="in_progress"
     )
-    db.add(response)
+    
+    db.add(session)
     db.commit()
     
-    return {"status": "success", "message": "Response recorded"}
+    questions = generate_questions(session_data.problem_description)
+    questions_dict = [{"key": q.key, "text": q.text, "type": q.type} for q in questions]
+    
+    return {
+        "session_id": session_uuid,
+        "questions": questions_dict
+    }
 
-@app.post("/sessions/{session_id}/complete")
-async def complete_session(session_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Vérifier la session
+@app.post("/sessions/respond")
+async def respond_to_question(response_data: QuestionAnswer, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Vérifier que la session appartient à l'utilisateur
     session = db.query(CoachingSession).filter(
-        CoachingSession.id == session_id,
+        CoachingSession.uuid == response_data.session_id,
         CoachingSession.user_id == current_user.id
     ).first()
     
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+        raise HTTPException(status_code=404, detail="Session non trouvée")
+    
+    # Enregistrer la réponse
+    question_response = QuestionResponse(
+        session_uuid=response_data.session_id,
+        question_key=response_data.question_key,
+        answer=response_data.answer
+    )
+    
+    db.add(question_response)
+    db.commit()
+    
+    return {"status": "success"}
+
+@app.post("/sessions/complete/{session_id}")
+async def complete_session(session_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Vérifier la session
+    session = db.query(CoachingSession).filter(
+        CoachingSession.uuid == session_id,
+        CoachingSession.user_id == current_user.id
+    ).first()
+    
+    if not session:
+        raise HTTPException(status_code=404, detail="Session non trouvée")
     
     # Récupérer toutes les réponses
-    responses = db.query(QuestionResponse).filter(QuestionResponse.session_id == session_id).all()
-    response_data = [{"question_key": r.question_key, "response": r.response} for r in responses]
+    responses = db.query(QuestionResponse).filter(QuestionResponse.session_uuid == session_id).all()
+    responses_list = [{"question_key": r.question_key, "answer": r.answer} for r in responses]
     
-    # Analyser et générer le plan d'action
-    analysis = QuestionsEngine.analyze_responses(response_data, session.problem_description)
+    # Analyser
+    analysis = analyze_responses(session.problem_description, responses_list)
+    action_plan = generate_action_plan(analysis)
     
-    # Créer le plan d'action
-    import json
-    action_plan = ActionPlan(
-        session_id=session_id,
-        inherited_fixed=json.dumps(analysis["inherited_fixed"]),
-        inherited_changeable=json.dumps(analysis["inherited_changeable"]),
-        created_fixed=json.dumps(analysis["created_fixed"]),
-        created_actionable=json.dumps(analysis["created_actionable"]),
-        actions=json.dumps(analysis["actions"])
+    # Sauvegarder l'analyse
+    action_plan_record = ActionPlan(
+        session_uuid=session_id,
+        analysis=str(analysis),
+        actions=str(action_plan)
     )
-    db.add(action_plan)
+    
+    db.add(action_plan_record)
     
     # Marquer la session comme terminée
     session.status = "completed"
     session.completed_at = datetime.utcnow()
+    
     db.commit()
     
     return {
-        "status": "completed",
-        "analysis": analysis
+        "analysis": analysis,
+        "action_plan": action_plan
     }
 
 @app.get("/sessions/history")
 async def get_session_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     sessions = db.query(CoachingSession).filter(CoachingSession.user_id == current_user.id).order_by(CoachingSession.created_at.desc()).all()
     
-    result = []
-    for session in sessions:
-        session_data = {
-            "id": session.id,
-            "title": session.title,
+    return [
+        {
+            "uuid": session.uuid,
+            "problem_description": session.problem_description,
             "status": session.status,
             "created_at": session.created_at.isoformat(),
             "completed_at": session.completed_at.isoformat() if session.completed_at else None
         }
-        
-        if session.action_plan:
-            import json
-            session_data["analysis"] = {
-                "inherited_fixed": json.loads(session.action_plan.inherited_fixed),
-                "inherited_changeable": json.loads(session.action_plan.inherited_changeable),
-                "created_fixed": json.loads(session.action_plan.created_fixed),
-                "created_actionable": json.loads(session.action_plan.created_actionable),
-                "actions": json.loads(session.action_plan.actions)
-            }
-        
-        result.append(session_data)
-    
-    return {"sessions": result}
+        for session in sessions
+    ]
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
-
+# Point d'entrée pour Railway
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
